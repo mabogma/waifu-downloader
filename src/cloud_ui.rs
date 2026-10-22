@@ -31,6 +31,8 @@ impl GalleryApp {
             self.album_rename.clear();
         }
         self.cloud_data = data;
+        self.remote_failed.clear();
+        self.queue_favorite_thumbnails();
     }
     fn cloud_events(&mut self) {
         while let Ok(event) = self.cloud.rx.try_recv() {
@@ -292,5 +294,6 @@ impl GalleryApp {
             self.message("Добавлено в избранное на этом компьютере. У этого старого файла нет исходной ссылки для синхронизации.",false);
         }
         self.changed();
+        self.queue_favorite_thumbnails();
     }
 }

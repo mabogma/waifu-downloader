@@ -3,7 +3,10 @@ impl GalleryApp {
         if entries.is_empty() || index >= entries.len() {
             return;
         }
-        self.lightbox = Some(GalleryViewer::new(entries, index));
+        self.gallery_epoch+=1;
+        self.workers.prefetch_generation.store(self.gallery_epoch,std::sync::atomic::Ordering::Relaxed);
+        let mut viewer=GalleryViewer::new(entries,index);viewer.session=self.gallery_epoch;
+        self.lightbox=Some(viewer);
         self.gallery_load_current();
     }
     fn gallery_load_current(&mut self) {
@@ -21,7 +24,7 @@ impl GalleryApp {
             }
             return;
         }
-        if g.busy || g.error.is_some() {
+        if g.busy || g.error.is_some() || g.pending.contains(&g.entries[g.index].key()) {
             return;
         }
         let entry = g.entries[g.index].clone();
@@ -78,6 +81,25 @@ impl GalleryApp {
         }
         self.gallery_load_current();
     }
+    fn gallery_prefetch_neighbors(&mut self) {
+        if !self.settings.prefetch{return;}
+        let Some(g)=self.lightbox.as_mut() else{return;};
+        if g.busy||g.loaded().is_none()||g.pending.len()>=2{return;}
+        for index in g.neighbors(){
+            let entry=g.entries[index].clone();let key=entry.key();
+            if g.cache.iter().any(|(k,_)|k==&key)||g.pending.contains(&key)||g.prefetch_seen.contains(&key){continue;}
+            if self.workers.gallery_prefetch.try_send((g.session,entry)).is_ok(){g.pending.insert(key.clone());g.prefetch_seen.insert(key);}else{break;}
+        }
+    }
+    fn gallery_prefetch_result(&mut self,session:u64,key:String,result:Result<Box<Loaded>,String>){
+        let Some(g)=self.lightbox.as_mut() else{return;};
+        if g.session!=session{return;}
+        g.pending.remove(&key);
+        if let Ok(loaded)=result{
+            if g.entries[g.index].key()==key||g.neighbors().iter().any(|&i|g.entries[i].key()==key){g.insert(key,*loaded);}
+        }
+        self.gallery_load_current();
+    }
     fn gallery_grid(&mut self, ui: &mut egui::Ui, entries: Vec<GalleryEntry>, id: &str) {
         if entries.is_empty() {
             ui.add_space(70.0);
@@ -113,7 +135,7 @@ impl GalleryApp {
                                         ui.set_width((width - 20.0).max(100.0));
                                         let texture = match entry {
                                             GalleryEntry::Local(path) => {
-                                                if !self.thumbs.contains_key(path)
+                                                if !self.remote_thumbs.contains_key(&path.to_string_lossy().to_string()) && !self.thumbs.contains_key(path)
                                                     && !self.thumb_failed.contains(path)
                                                     && !self.thumb_pending.contains(path)
                                                     && self
@@ -124,7 +146,7 @@ impl GalleryApp {
                                                 {
                                                     self.thumb_pending.insert(path.clone());
                                                 }
-                                                self.thumbs.get(path).cloned()
+                                                self.thumbs.get(path).cloned().or_else(||self.remote_thumbs.get(&path.to_string_lossy().to_string()).cloned())
                                             }
                                             GalleryEntry::Remote(meta) => {
                                                 let texture = self
@@ -141,7 +163,7 @@ impl GalleryApp {
                                                     && self
                                                         .workers
                                                         .remote_thumbs
-                                                        .try_send(meta.clone())
+                                                        .try_send((meta.clone(),self.saved_sources.get(&meta.key).and_then(|p|p.first()).cloned()))
                                                         .is_ok()
                                                 {
                                                     self.remote_pending.insert(meta.key.clone());
@@ -310,6 +332,7 @@ impl GalleryApp {
             return;
         }
         self.gallery_load_current();
+        self.gallery_prefetch_neighbors();
         if !ctx.wants_keyboard_input() && !ctx.memory(|m| m.any_popup_open()) {
             if ctx
                 .input(|i| i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Space))
@@ -372,7 +395,7 @@ impl GalleryApp {
                 let (rect,response)=ui.allocate_exact_size(egui::vec2(45.0,52.0),egui::Sense::click());ui.painter().rect_filled(rect,6,self.card());
                 if let Some(t)=texture{let fit=(rect.width()/t.size_vec2().x).min(rect.height()/t.size_vec2().y);let r=egui::Rect::from_center_size(rect.center(),t.size_vec2()*fit);ui.painter().image(t.id(),r,egui::Rect::from_min_max(egui::Pos2::ZERO,egui::pos2(1.0,1.0)),Color32::WHITE);}else{icons::paint(ui,Icon::Image,rect.center(),18.0,self.muted());}
                 if selected{ui.painter().rect_stroke(rect,6,egui::Stroke::new(2.0,self.ac()),egui::StrokeKind::Inside);}
-                if response.on_hover_text(format!("Фото {}",index+1)).clicked(){let g=self.lightbox.as_mut().unwrap();g.index=index;g.texture=None;g.error=None;g.zoom=1.0;}
+                if response.on_hover_text(format!("Фото {}",index+1)).clicked(){let g=self.lightbox.as_mut().unwrap();g.index=index;g.prefetch_seen.clear();g.texture=None;g.error=None;g.zoom=1.0;}
             }});
             ui.label(RichText::new("Стрелки — листать   ·   Esc — к миниатюрам   ·   двойной щелчок — масштаб").size(11.0).color(self.muted()));
         });
@@ -383,6 +406,7 @@ impl GalleryApp {
             self.gallery_step(step);
         }
         if close || response.should_close() {
+            self.workers.prefetch_generation.store(0,std::sync::atomic::Ordering::Relaxed);
             self.lightbox = None;
             self.gallery_epoch += 1;
         }

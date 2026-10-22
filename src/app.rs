@@ -81,6 +81,7 @@ pub struct GalleryApp {
     thumb_pending: HashSet<PathBuf>,
     thumb_failed: HashSet<PathBuf>,
     remote_thumbs: HashMap<String, TextureHandle>,
+    thumb_warmup: VecDeque<(Metadata,Option<PathBuf>)>,
     remote_pending: HashSet<String>,
     remote_failed: HashSet<String>,
     settings_open: bool,
@@ -117,7 +118,7 @@ pub struct GalleryApp {
 impl GalleryApp {
     pub fn new(cc: &eframe::CreationContext<'_>, base: PathBuf, smoke: bool) -> Self {
         let (settings, warning) = Settings::load(&base);
-        let workers = Workers::start(cc.egui_ctx.clone());
+        let workers = Workers::start_with_cache(cc.egui_ctx.clone(),Some(base.join("cache/thumbnails")));
         if !settings.use_custom_url {let _ = workers.net.try_send(NetJob::Tags);}
         let _ = workers.disk.try_send(DiskJob::Appearance);
         let cloud = cloud::Worker::start(cc.egui_ctx.clone());
@@ -176,6 +177,7 @@ impl GalleryApp {
             thumb_pending: HashSet::new(),
             thumb_failed: HashSet::new(),
             remote_thumbs: HashMap::new(),
+            thumb_warmup: VecDeque::new(),
             remote_pending: HashSet::new(),
             remote_failed: HashSet::new(),
             settings_open: false,
@@ -470,7 +472,8 @@ impl GalleryApp {
     fn events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.workers.events.try_recv() {
             match event {
-                Event::SavedIndex(epoch,index) => {if epoch==self.library_epoch{self.saved_sources=index;}},
+                Event::GalleryPrefetch(session,key,result)=>self.gallery_prefetch_result(session,key,result),
+                Event::SavedIndex(epoch,index) => {if epoch==self.library_epoch{self.saved_sources=index;self.queue_favorite_thumbnails();}},
                 Event::Gallery(epoch, result) => {
                     self.gallery_result(ctx, epoch, result);
                 }
@@ -1225,7 +1228,7 @@ impl GalleryApp {
                         },
                         2=>{
                             ui.label(RichText::new("Загрузка и управление").size(24.0).strong());ui.add_space(16.0);
-                            ui.checkbox(&mut self.settings.prefetch,"Предзагружать следующую картинку");ui.small("Следующая картинка будет готова быстрее. Расходует трафик.");
+                            if ui.checkbox(&mut self.settings.prefetch,"Предзагружать соседние фотографии").changed(){self.queue_favorite_thumbnails();}ui.small("Ускоряет листание просмотра, избранного и альбомов. Расходует трафик.");
                             
                             ui.add_space(18.0);self.update_settings_ui(ui,ctx);
                             ui.add_space(18.0);ui.strong("Горячие клавиши");ui.label("Пробел / N — новая картинка\nS — сохранить\n← / → — история\nCtrl+, — настройки");
@@ -1344,6 +1347,7 @@ impl GalleryApp {
                 14 => "preview-account.png",
                 17 => "preview-gallery.png",
                 20 => "preview-sources.png",
+                22 => "preview-favorites.png",
                 _ => "preview.png",
             };
             let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
@@ -1373,6 +1377,7 @@ impl GalleryApp {
                     self.capture_after = Instant::now() + Duration::from_millis(400);
                     self.smoke_phase = 13;
                 }
+                22 => {self.smoke_phase=12;ctx.send_viewport_cmd(egui::ViewportCommand::Close);}
                 17 => {
                     self.smoke_phase = 18;
                 }
@@ -1419,6 +1424,9 @@ impl GalleryApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.smoke_phase = 8;
             }
+            21 if Instant::now() >= self.capture_after && self.cloud_data.favorites.first().is_some_and(|m|self.remote_thumbs.contains_key(&m.key)) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));self.smoke_phase=22;
+            }
             19 if Instant::now() >= self.capture_after => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));self.smoke_phase=20;
             }
@@ -1438,7 +1446,7 @@ impl GalleryApp {
             11 if self
                 .lightbox
                 .as_ref()
-                .is_some_and(|g| g.loaded().is_some() && !g.busy) =>
+                .is_some_and(|g| g.loaded().is_some() && !g.busy && (!self.settings.prefetch || g.neighbors().iter().all(|&i|g.cache.iter().any(|(k,_)|k==&g.entries[i].key())))) =>
             {
                 self.gallery_step(1);
                 self.smoke_phase = 15;
@@ -1472,9 +1480,9 @@ impl GalleryApp {
                     && image::image_dimensions(path)
                         .is_ok_and(|d| d == (loaded.dimensions[0], loaded.dimensions[1]))
                     && loaded.meta.key.starts_with("http");
-                let _=std::fs::write(self.base.join("smoke-result.txt"),format!("{}: saved_index=true, favorite=true, gallery_separate=true, next_previous=true, history_len={}, dimensions={:?}",if ok{"OK"}else{"FAILED"},self.history.len(),loaded.dimensions));
-                self.smoke_phase = 12;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                let _=std::fs::write(self.base.join("smoke-result.txt"),format!("{}: prefetch=true, saved_index=true, favorite=true, gallery_separate=true, next_previous=true, history_len={}, dimensions={:?}",if ok{"OK"}else{"FAILED"},self.history.len(),loaded.dimensions));
+                let mut remote=loaded.meta.clone();remote.key.push_str("#thumb-smoke");self.cloud_data.favorites=vec![remote];self.queue_favorite_thumbnails();
+                self.lightbox=None;self.workers.prefetch_generation.store(0,std::sync::atomic::Ordering::Relaxed);self.view=View::Favorites;self.capture_after=Instant::now()+Duration::from_millis(400);self.smoke_phase=21;
             }
             _ => {}
         }
@@ -1485,6 +1493,7 @@ impl eframe::App for GalleryApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.events(ctx);
         self.cloud_events();
+        self.warm_favorite_thumbnails();
         if ctx.input(|i| i.viewport().close_requested()) && !self.saving.is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = true;

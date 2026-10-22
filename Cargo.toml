@@ -1,6 +1,6 @@
 [package]
 name = "waifu-gallery"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 description = "A fast native Waifu.im gallery"
 license = "MIT"

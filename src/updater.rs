@@ -8,8 +8,8 @@ use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     time::Duration,
 };
-const API: &str = "https://api.github.com/repos/MakarBogatyrev1/waifu-downloader/releases/latest";
-const PREFIX: &str = "https://github.com/MakarBogatyrev1/waifu-downloader/releases/download/";
+const API: &str = "https://api.github.com/repos/mabogma/waifu-downloader/releases/latest";
+const PREFIX: &str = "https://github.com/mabogma/waifu-downloader/releases/download/";
 const LIMIT: u64 = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Ready {

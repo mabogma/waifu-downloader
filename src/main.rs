@@ -10,6 +10,7 @@ mod settings;
 mod sources;
 mod system;
 mod updater;
+mod thumb_cache;
 mod worker;
 
 fn main() -> eframe::Result<()> {

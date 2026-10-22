@@ -30,6 +30,7 @@ pub enum DiskJob {
     Flush(Sender<()>),
 }
 pub enum Event {
+    GalleryPrefetch(u64, String, Result<Box<Loaded>,String>),
     SavedIndex(u64, std::collections::HashMap<String, Vec<PathBuf>>),
     SourceTags(String, String, Result<Vec<String>,String>),
     Gallery(u64, Result<Box<Loaded>, String>),
@@ -44,7 +45,9 @@ pub enum Event {
     Appearance(system::Appearance),
 }
 pub struct Workers {
-    pub remote_thumbs: SyncSender<Metadata>,
+    pub gallery_prefetch: SyncSender<(u64,crate::gallery::Entry)>,
+    pub prefetch_generation: Arc<std::sync::atomic::AtomicU64>,
+    pub remote_thumbs: SyncSender<(Metadata,Option<PathBuf>)>,
     pub net: SyncSender<NetJob>,
     pub disk: SyncSender<DiskJob>,
     pub events: Receiver<Event>,
@@ -55,23 +58,39 @@ fn emit(tx: &Sender<Event>, ctx: &Context, event: Event) {
     }
 }
 impl Workers {
-    pub fn start(ctx: Context) -> Self {
+    #[cfg(test)]
+    pub fn start(ctx:Context)->Self {Self::start_with_cache(ctx,None)}
+    pub fn start_with_cache(ctx: Context,cache:Option<PathBuf>) -> Self {
         let (tx, events) = mpsc::channel();
         let (net_tx, net_rx) = mpsc::sync_channel(2);
         let (disk_tx, disk_rx) = mpsc::sync_channel(24);
-        let (thumb_tx, thumb_rx) = mpsc::sync_channel::<Metadata>(1);
-        let thumb_events = tx.clone();
-        let thumb_ctx = ctx.clone();
+        let (thumb_tx,thumb_rx)=mpsc::sync_channel::<(Metadata,Option<PathBuf>)>(24);
+        let thumb_rx=Arc::new(std::sync::Mutex::new(thumb_rx));
+        for _ in 0..3 {
+            let rx=thumb_rx.clone();let tx=tx.clone();let ctx=ctx.clone();let cache=cache.clone();
+            std::thread::spawn(move || {
+                let api=Api::new();
+                loop {
+                    let job={rx.lock().unwrap().recv()};let Ok((meta,local))=job else{break;};
+                    let key=meta.key.clone();
+                    let result=crate::thumb_cache::load(api.as_ref().map_err(Clone::clone),meta,local,cache.as_deref());
+                    emit(&tx,&ctx,Event::RemoteThumb(key,result));
+                }
+            });
+        }
+        let (gallery_prefetch,prefetch_rx)=mpsc::sync_channel::<(u64,crate::gallery::Entry)>(1);
+        let prefetch_generation=Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let generation=prefetch_generation.clone();let pt=tx.clone();let pc=ctx.clone();
         std::thread::spawn(move || {
-            let api = Api::new();
-            while let Ok(meta) = thumb_rx.recv() {
-                let key = meta.key.clone();
-                let result = api.as_ref().map_err(Clone::clone).and_then(|a| {
-                    let d = a.direct(meta)?;
-                    assets::load(Source::Memory(Arc::new(d.bytes)), d.meta)
-                        .map(|loaded| loaded.thumbnail)
-                });
-                emit(&thumb_events, &thumb_ctx, Event::RemoteThumb(key, result));
+            let api=Api::new();
+            while let Ok((session,entry))=prefetch_rx.recv(){
+                if generation.load(std::sync::atomic::Ordering::Relaxed)!=session{continue;}
+                let key=entry.key();
+                let result=match entry {
+                    crate::gallery::Entry::Local(path)=>assets::load(Source::Disk(path.clone()),assets::disk_metadata(&path)),
+                    crate::gallery::Entry::Remote(meta)=>api.as_ref().map_err(Clone::clone).and_then(|a|a.direct(meta)).and_then(|d|assets::load(Source::Memory(Arc::new(d.bytes)),d.meta)),
+                }.map(Box::new);
+                if generation.load(std::sync::atomic::Ordering::Relaxed)==session {emit(&pt,&pc,Event::GalleryPrefetch(session,key,result));}
             }
         });
         let nt = tx.clone();
@@ -158,6 +177,8 @@ impl Workers {
             }
         });
         Self {
+            gallery_prefetch,
+            prefetch_generation,
             remote_thumbs: thumb_tx,
             net: net_tx,
             disk: disk_tx,

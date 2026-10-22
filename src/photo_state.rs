@@ -1,4 +1,24 @@
 impl GalleryApp {
+    fn queue_favorite_thumbnails(&mut self) {
+        self.thumb_warmup.clear();
+        if !self.settings.prefetch{return;}
+        for meta in self.cloud_data.favorites.iter().take(48){
+            self.thumb_warmup.push_back((meta.clone(),self.saved_sources.get(&meta.key).and_then(|paths|paths.first()).cloned()));
+        }
+        for path in self.settings.local_favorites.iter().take(48){
+            self.thumb_warmup.push_back((Metadata{key:path.to_string_lossy().into(),source:None,artist:String::new(),mode:"SFW".into(),tag:"waifu".into()},Some(path.clone())));
+        }
+    }
+    fn warm_favorite_thumbnails(&mut self) {
+        if !self.settings.prefetch{return;}
+        while self.remote_pending.len()<12 {
+            let Some((meta,path))=self.thumb_warmup.pop_front() else{break;};
+            if self.remote_thumbs.contains_key(&meta.key)||self.remote_pending.contains(&meta.key)||self.remote_failed.contains(&meta.key){continue;}
+            let key=meta.key.clone();
+            if let Err(error)=self.workers.remote_thumbs.try_send((meta,path)) {let job=match error{std::sync::mpsc::TrySendError::Full(job)|std::sync::mpsc::TrySendError::Disconnected(job)=>job};self.thumb_warmup.push_front(job);break;}
+            self.remote_pending.insert(key);
+        }
+    }
     fn toggle_photo_favorite(&mut self, meta: Metadata, path: Option<PathBuf>) {
         let path=path.or_else(||self.saved_sources.get(&meta.key).and_then(|p|p.first()).cloned());
         let favorite=self.photo_favorite(&meta.key)||path.as_ref().is_some_and(|p|self.settings.local_favorites.contains(p));
